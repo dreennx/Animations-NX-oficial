@@ -475,9 +475,187 @@ local function preloadBg(list)
     task.spawn(function() pcall(function() ContentProvider:PreloadAsync(list) end) end)
 end
 
+-- ================= ★ NX FETCH EN VIVO: cualquier bundle del catálogo =================
+-- Baja bajo demanda CUALQUIER pack de animación de Roblox (no solo los 310 precargados),
+-- lo arma en la estructura del DB y lo guarda en anims_cache.json (una vez → permanente).
+-- Usa la sesión del executor: NO necesita tu cuenta ni login, solo estar dentro del juego.
+
+-- HTTP portátil: prueba las funciones que exponen los executors más comunes
+local function nxHttpGet(url)
+    local tries = {
+        function() return syn and syn.request and syn.request({Url=url, Method="GET"}).Body end,
+        function() return http and http.request and http.request({Url=url, Method="GET"}).Body end,
+        function() return http_request and http_request({Url=url, Method="GET"}).Body end,
+        function() return request and request({Url=url, Method="GET"}).Body end,
+        function() return fluxus and fluxus.request and fluxus.request({Url=url, Method="GET"}).Body end,
+        function() return game.HttpGet and game:HttpGet(url) end,
+        function() return game.HttpGetAsync and game:HttpGetAsync(url) end,
+    }
+    for _, fn in ipairs(tries) do
+        local ok, res = pcall(fn)
+        if ok and type(res) == "string" and #res > 0 then return res end
+    end
+    return nil
+end
+
+-- nombre (de carpeta / item / animación) → tipo de animación del DB
+local function nxAnimType(name)
+    name = string.lower(tostring(name or ""))
+    if name:find("swim") then return "SwimAnimation", (name:find("idle") ~= nil) end
+    if name:find("walk")  then return "WalkAnimation"  end
+    if name:find("run")   then return "RunAnimation"   end
+    if name:find("idle")  then return "IdleAnimation"  end
+    if name:find("jump")  then return "JumpAnimation"  end
+    if name:find("fall")  then return "FallAnimation"  end
+    if name:find("climb") then return "ClimbAnimation" end
+    return nil
+end
+
+-- recorre un objeto ya cargado (game:GetObjects) y clasifica cada Animation que encuentre
+local function nxCollect(entry, root, hintName)
+    if typeof(root) ~= "Instance" then return end
+    local anims = {}
+    if root:IsA("Animation") then anims[1] = root
+    else for _, d in ipairs(root:GetDescendants()) do if d:IsA("Animation") then anims[#anims+1] = d end end end
+    for _, a in ipairs(anims) do
+        local id = tostring(a.AnimationId):match("(%d+)")
+        if id and id ~= "0" then
+            -- clasifica subiendo por los padres (carpetas idle/walk/run...), luego hint, luego nombre
+            local atype, isSwimIdle, matched
+            local node = a.Parent
+            for _ = 1, 6 do
+                if not node or node == workspace then break end
+                local t, s = nxAnimType(node.Name)
+                if t then atype, isSwimIdle, matched = t, s, node.Name; break end
+                node = node.Parent
+            end
+            if not atype then atype, isSwimIdle, matched = nxAnimType(a.Name) ; matched = a.Name end
+            if not atype then atype, isSwimIdle, matched = nxAnimType(hintName) ; matched = hintName end
+            if atype then
+                entry[atype] = entry[atype] or {}
+                local track
+                if atype == "IdleAnimation" then
+                    local n = 0; for _ in pairs(entry[atype]) do n = n + 1 end
+                    track = "Animation" .. (n + 1)
+                elseif atype == "SwimAnimation" then
+                    track = isSwimIdle and "SwimIdleAnim" or "SwimAnim"
+                else
+                    track = ({WalkAnimation="WalkAnim", RunAnimation="RunAnim", JumpAnimation="JumpAnim",
+                              FallAnimation="FallAnim", ClimbAnimation="ClimbAnim"})[atype]
+                end
+                if track and not entry[atype][track] then
+                    entry[atype][track] = "rbxassetid://" .. id
+                end
+            end
+        end
+    end
+end
+
+-- guarda el DB completo al archivo (persistente entre sesiones)
+local function nxSaveDB()
+    pcall(function()
+        if typeof(writefile) == "function" then
+            writefile(CACHE_PATH, HttpService:JSONEncode(DB))
+        end
+    end)
+end
+
+-- baja un bundle por ID, arma su entrada en DB y la persiste. Devuelve la entrada o nil.
+local function fetchBundleLive(bundleId)
+    bundleId = tostring(bundleId)
+    if DB[bundleId] then return DB[bundleId] end
+    local entry, realName = {}, nil
+
+    -- A) detalles del bundle vía web (items = cada animación como asset del catálogo)
+    local body = nxHttpGet("https://catalog.roblox.com/v1/bundles/" .. bundleId .. "/details")
+    local data = body and safeDecode(body)
+    if type(data) == "table" then
+        realName = data.name or data.Name
+        local items = data.items or data.Items
+        if type(items) == "table" then
+            -- ★ FIX LAG: baja TODOS los items del bundle EN PARALELO. Antes era una serie
+            -- bloqueante (un game:GetObjects tras otro) → freeze grande al pegar un link.
+            local results, pending = {}, 0
+            for i, it in ipairs(items) do
+                local itId   = it.id or it.Id
+                local itType = tostring(it.type or it.Type or "")
+                if itId and (itType == "Asset" or itType == "UserOutfit" or itType == "") then
+                    pending = pending + 1
+                    task.spawn(function()
+                        local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. itId) end)
+                        results[i] = { objs = (ok and objs) or nil, hint = it.name or it.Name }
+                        pending = pending - 1
+                    end)
+                end
+            end
+            if pending > 0 then
+                local t0 = os.clock()
+                while pending > 0 and os.clock() - t0 < 15 do task.wait() end
+            end
+            -- collect EN ORDEN (evita choques al numerar IdleAnimation1/2/3)
+            for i = 1, #items do
+                local r = results[i]
+                if r and r.objs then for _, o in ipairs(r.objs) do nxCollect(entry, o, r.hint) end end
+            end
+        end
+    end
+
+    -- B) fallback sin web: AvatarEditorService (usa tu sesión del juego)
+    if next(entry) == nil then
+        pcall(function()
+            local AES = game:GetService("AvatarEditorService")
+            local det = AES:GetItemDetails(tonumber(bundleId), Enum.AvatarItemType.Bundle)
+            if det then
+                realName = realName or det.Name
+                local bi = det.BundledItems or det.bundledItems
+                if type(bi) == "table" then
+                    -- ★ FIX LAG: igual que la ruta A, en PARALELO en vez de en serie.
+                    local results, pending = {}, 0
+                    for i, it in ipairs(bi) do
+                        local itId = it.Id or it.id
+                        if itId and tostring(it.Type or it.type) == "Asset" then
+                            pending = pending + 1
+                            task.spawn(function()
+                                local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. itId) end)
+                                results[i] = { objs = (ok and objs) or nil, hint = it.Name or it.name }
+                                pending = pending - 1
+                            end)
+                        end
+                    end
+                    if pending > 0 then
+                        local t0 = os.clock()
+                        while pending > 0 and os.clock() - t0 < 15 do task.wait() end
+                    end
+                    for i = 1, #bi do
+                        local r = results[i]
+                        if r and r.objs then for _, o in ipairs(r.objs) do nxCollect(entry, o, r.hint) end end
+                    end
+                end
+            end
+        end)
+    end
+
+    -- C) último recurso: tratar el ID como asset directo (packs clásicos empaquetados)
+    if next(entry) == nil then
+        local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. bundleId) end)
+        if ok and objs then for _, o in ipairs(objs) do nxCollect(entry, o, nil) end end
+    end
+
+    if next(entry) == nil then return nil end   -- no se pudo resolver nada
+
+    DB[bundleId] = entry
+    if realName and realName ~= "" then
+        NAMES[bundleId] = realName
+        for _, e in ipairs(CATALOG) do if e[1] == bundleId then e[2] = realName; break end end
+    end
+    nxSaveDB()
+    return entry
+end
+
 -- FASE 1 · puede tardar (descarga) pero NO toca el personaje
 local function prepareBundle(animType, bundleId)
     local bundleData = DB[bundleId]
+    if not bundleData then bundleData = fetchBundleLive(bundleId) end   -- ★ auto-descarga si no está en cache
     if not bundleData or not bundleData[animType] then return nil end
     local names, urls = {}, {}
     for trackName, url in pairs(bundleData[animType]) do
@@ -1134,7 +1312,7 @@ searchBox.BackgroundColor3 = C.SURFACE; searchBox.BackgroundTransparency = 0.1; 
 corner(searchBox, 10); local searchStroke = glassStroke(searchBox, 0.7, 1)
 local search = Instance.new("TextBox", searchBox)
 search.BackgroundTransparency = 1; search.Position = UDim2.new(0, 14, 0, 0); search.Size = UDim2.new(1, -26, 1, 0)
-search.FontFace = FONT; search.PlaceholderText = "Buscar animación..."; search.PlaceholderColor3 = C.TEXT_LO
+search.FontFace = FONT; search.PlaceholderText = "Buscar  ·  o pega un ID/link de pack  ·  o !all"; search.PlaceholderColor3 = C.TEXT_LO
 search.Text = ""; search.TextColor3 = C.TEXT_HI; search.TextSize = 14; search.TextXAlignment = Enum.TextXAlignment.Left
 search.ClearTextOnFocus = false
 
@@ -1413,20 +1591,27 @@ end
 local applyBusy = false
 
 function applyFull(bid)          -- aplica pack completo. NO toca mixSlots.
-    if not DB[bid] then toast("Ese pack no tiene datos", false) return end
     if applyBusy then toast("Espera, aún está cargando...", false) return end
-    activeFull = bid
-    activeMode = "full"
-    local first = not bundleCached(bid)
+    local first = not DB[bid] or not bundleCached(bid)
     if first then toast("⏳ Cargando " .. (NAMES[bid] or bid) .. "...", true) end
     applyBusy = true
     task.spawn(function()
+        if not DB[bid] then                       -- ★ no está en cache → bajarlo del catálogo
+            local got = fetchBundleLive(bid)
+            if not got then
+                applyBusy = false
+                if alive() then toast("✗ No pude bajar ese pack (ID inválido o sin HTTP)", false) end
+                return
+            end
+        end
+        activeFull = bid
+        activeMode = "full"
         projectFull(bid)
         pcall(applyFullMix)      -- motor intacto (lee currentMix)
         applyBusy = false
         if not alive() then return end
         saveConfig()
-        if currentTab == "anims" then animsList.render() elseif currentTab == "fav" then favList.render() end
+        if currentTab == "anims" then refreshAnims(false) elseif currentTab == "fav" then favList.render() end
         refreshActiveCard()
         toast("✓ " .. (NAMES[bid] or bid), true)
     end)
@@ -1451,10 +1636,20 @@ function applyMixPreset()        -- aplica el MIX (preset)
 end
 
 function assignSlot(atype, bid)  -- asigna un pack a una ranura del MIX (live)
-    if not (DB[bid] and DB[bid][atype]) then
+    if applyBusy then toast("Espera, aún está cargando...", false) return end
+    if not DB[bid] then          -- ★ no está en cache → bajarlo y reintentar
+        toast("⏳ Bajando " .. (NAMES[bid] or bid) .. "...", true)
+        task.spawn(function()
+            local got = fetchBundleLive(bid)
+            if not alive() then return end
+            if got then assignSlot(atype, bid)
+            else toast("✗ No pude bajar ese pack", false) end
+        end)
+        return
+    end
+    if not DB[bid][atype] then
         toast("Ese pack no tiene " .. ANIM_SHORT[atype], false) return
     end
-    if applyBusy then toast("Espera, aún está cargando...", false) return end
     mixSlots[atype] = bid
     activeMode = "mix"
     activeFull = nil
@@ -1543,6 +1738,75 @@ search:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 search.Focused:Connect(function() searchStroke.Color = C.ACCENT; searchStroke.Transparency = 0.25 end)
 search.FocusLost:Connect(function() searchStroke.Color = C.WHITE; searchStroke.Transparency = 0.7 end)
+
+-- ★ IMPORTAR CATÁLOGO ACTUAL: escribe "!all" y Enter → agrega a la lista todos los packs
+--   de animación que Roblox tenga ahorita (los datos de cada uno se bajan al tocarlo).
+local function nxImportCatalog()
+    task.spawn(function()
+        local okP, params = pcall(function()
+            local p = CatalogSearchParams.new()
+            if not pcall(function() p.BundleTypes = {Enum.BundleType.Animations} end) then
+                pcall(function() p.BundleTypes = {Enum.BundleType.AvatarAnimations} end)
+            end
+            return p
+        end)
+        if not okP or not params then toast("✗ Tu executor no soporta CatalogSearchParams", false) return end
+        local AES = game:GetService("AvatarEditorService")
+        local ok, pages = pcall(function() return AES:SearchCatalog(params) end)
+        if not ok or not pages then toast("✗ SearchCatalog no disponible en tu executor", false) return end
+        local added, safety = 0, 0
+        repeat
+            safety = safety + 1
+            local page = {}
+            pcall(function() page = pages:GetCurrentPage() end)
+            for _, it in ipairs(page) do
+                local id = tostring(it.Id or it.id or "")
+                if id ~= "" and not NAMES[id] then
+                    local nm = tostring(it.Name or it.name or ("Bundle " .. id))
+                    CATALOG[#CATALOG + 1] = { id, nm }
+                    NAMES[id] = nm
+                    added = added + 1
+                end
+            end
+            toast("Importando catálogo... +" .. added, true)
+            if pages.IsFinished then break end
+            local okNext = pcall(function() pages:AdvanceToNextPageAsync() end)
+            if not okNext then break end
+        until pages.IsFinished or safety > 400 or not alive()
+        if not alive() then return end
+        if currentTab == "anims" then refreshAnims(true) end
+        toast("✓ " .. added .. " packs nuevos. Toca cualquiera para bajarlo.", true)
+    end)
+end
+
+-- Enter en el buscador: si es un ID o un link de bundle → lo importa y lo aplica al toque.
+search.FocusLost:Connect(function(enterPressed)
+    if not enterPressed then return end
+    local t = tostring(search.Text)
+    if t:lower():gsub("%s", "") == "!all" then
+        search.Text = ""
+        toast("⏳ Buscando TODAS las animaciones de Roblox...", true)
+        nxImportCatalog()
+        return
+    end
+    -- acepta: .../bundles/ID, .../catalog/ID, ?id=ID, o un ID pelado
+    local id = t:match("bundles/(%d+)") or t:match("catalog/(%d+)")
+            or t:match("[?&]id=(%d+)") or t:match("^%s*(%d+)%s*$")
+    if id then
+        -- ★ FIX: antes ignoraba el link si el ID ya estaba en el catálogo (parecía "no carga").
+        -- Ahora CUALQUIER link/ID válido se importa y se aplica.
+        if not NAMES[id] then
+            CATALOG[#CATALOG + 1] = { id, "Bundle " .. id }
+            NAMES[id] = "Bundle " .. id
+        end
+        search.Text = ""
+        refreshAnims(true)
+        toast("⏳ Importando pack " .. id .. "...", true)
+        applyFull(id)
+    else
+        toast("Link/ID no reconocido", false)
+    end
+end)
 
 -- ================= SWITCH TAB =================
 function switchTab(id)
